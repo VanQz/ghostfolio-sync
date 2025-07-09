@@ -144,7 +144,9 @@ class SyncIBKR:
     def sync_ibkr(self):
         logger.info("Fetching Query")
         response = client.download(self.ibkrtoken, self.ibkrquery)
-        #logger.info("Parsing Query:\n%s", response)
+
+        # logger.info("Parsing Query:\n%s", response)
+        
         query: FlexQueryResponse = parser.parse(response)
         account_statement = self.get_account_flex_statement(query)
         activities = []
@@ -180,10 +182,10 @@ class SyncIBKR:
                 else:
                     logger.info("trade is not buy or sell (ignoring): %s", trade)
                     continue
-
+                
                 activities.append({
                     "accountId": account_id,
-                    "comment": f"tradeID={trade.tradeID}",
+                    "comment": f"tradeID={trade.ibOrderID}",
                     "currency": trade.currency,
                     "dataSource": data_source,
                     "date": iso_format,
