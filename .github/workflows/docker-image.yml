@@ -26,6 +26,6 @@ jobs:
 
       - name: Build and Push Image
         run: |
-          IMAGE_NAME=ghcr.io/${{ github.repository_owner }}/ghostfolio-sync
+          IMAGE_NAME=ghcr.io/vanqz/ghostfolio-sync
           docker build -t $IMAGE_NAME:latest .
           docker push $IMAGE_NAME:latest
