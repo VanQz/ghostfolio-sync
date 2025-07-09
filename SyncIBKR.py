@@ -161,7 +161,11 @@ class SyncIBKR:
             logger.info("Failed to retrieve account ID closing now")
             return
         self.set_cash_to_account(account_id, get_cash_amount_from_flex(account_statement))
-        for trade in account_statement.Trades:
+
+        # Get all stock transactions from the query
+        trades = self.get_stock_transactions(query)
+        
+        for trade in trades:
             if trade.openCloseIndicator is None:
                 logger.info("trade is not open or close (ignoring): %s", trade)
             elif trade.openCloseIndicator.CLOSE:
@@ -443,3 +447,28 @@ class SyncIBKR:
         return next(
             (flex_statement for flex_statement in query.FlexStatements if flex_statement.accountId == self.ibkr_account_id),
             None)
+
+    @staticmethod
+    def get_stock_transactions(query: FlexQueryResponse) -> list[Trade]:
+        skipped_categories_counter = {}
+        trades: list[Trade] = []
+        for flexStatement in query.FlexStatements:
+            for trade in flexStatement.Trades:
+                if trade.assetCategory is not trade.assetCategory.STOCK:
+                    logger.debug(
+                        f"ignore {trade.assetCategory}, {trade.symbol}: {trade}")
+                    existing_skips = skipped_categories_counter.get(trade.assetCategory,
+                                                                    0)
+                    skipped_categories_counter[trade.assetCategory] = existing_skips + 1
+                    continue
+
+                if trade.openCloseIndicator is None:
+                    logger.warning("trade is not open or close (ignoring): %s", trade)
+                    continue
+
+                trades.append(trade)
+
+        if len(skipped_categories_counter) > 0:
+            logger.info(f"Skipped: {skipped_categories_counter}")
+
+        return trades
