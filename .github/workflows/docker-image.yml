@@ -3,6 +3,7 @@ name: Docker Image CI
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
 
@@ -28,4 +29,10 @@ jobs:
         run: |
           IMAGE_NAME=ghcr.io/vanqz/ghostfolio-sync
           docker build -t $IMAGE_NAME:latest .
+      
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            docker tag $IMAGE_NAME:latest $IMAGE_NAME:${GITHUB_REF_NAME}
+            docker push $IMAGE_NAME:${GITHUB_REF_NAME}
+          fi
+      
           docker push $IMAGE_NAME:latest
