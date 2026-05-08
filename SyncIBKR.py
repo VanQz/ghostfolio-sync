@@ -5,7 +5,7 @@ from typing import Optional
 
 import requests
 import yaml
-from ibflex import client, parser, FlexQueryResponse, BuySell, FlexStatement, Trade
+from ibflex import client, parser, FlexQueryResponse, BuySell, FlexStatement, Trade, OpenClose
 
 # Create logger
 import logging
@@ -170,10 +170,11 @@ class SyncIBKR:
         for trade in trades:
             if trade.openCloseIndicator is None:
                 logger.info("trade is not open or close (ignoring): %s", trade)
-            elif trade.openCloseIndicator.CLOSE:
+            elif trade.openCloseIndicator in (OpenClose.OPEN, OpenClose.CLOSE, OpenClose.OPENCLOSE):
                 date = datetime.strptime(str(trade.dateTime), date_format)
                 iso_format = date.isoformat()
                 symbol = self.get_symbol_for_trade(trade, data_source)
+                trade_id = trade.tradeID or trade.transactionID or trade.ibOrderID
 
                 if trade.buySell == BuySell.BUY:
                     buysell = "BUY"
@@ -185,7 +186,7 @@ class SyncIBKR:
                 
                 activities.append({
                     "accountId": account_id,
-                    "comment": f"tradeID={trade.ibOrderID}",
+                    "comment": f"tradeID={trade_id}",
                     "currency": trade.currency,
                     "dataSource": data_source,
                     "date": iso_format,
