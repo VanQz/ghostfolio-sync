@@ -39,6 +39,14 @@ def _force_ndcdyn_submit_request(url, token, query):
 client.submit_request = _force_ndcdyn_submit_request
 
 
+# Ghostfolio renamed the "order" module to "activities": /api/v1/order was
+# deprecated in 2.248.0 and REMOVED in 3.5.0 (2026-05-24). Newer instances 404
+# on /api/v1/order, which silently broke dedup (no existing activities seen ->
+# everything re-imported every sync). Try the current endpoint first, fall back
+# to the legacy one so the tool still works on older instances.
+ACTIVITIES_ENDPOINTS = ("/api/v1/activities", "/api/v1/order")
+
+
 def get_cash_amount_from_flex(account_statement: FlexStatement) -> dict:
     logger.info("Getting cash amount")
     base_currency = account_statement.AccountInformation.currency
@@ -364,7 +372,7 @@ class SyncIBKR:
                 logger.info("Failed create: " + response.text)
 
     def delete_act(self, act_id):
-        url = f"{self.ghost_host}/api/v1/order/{act_id}"
+        url = f"{self.ghost_host}/api/v1/activities/{act_id}"
 
         payload = {}
         headers = {
@@ -404,7 +412,7 @@ class SyncIBKR:
         return True
 
     def addAct(self, act):
-        url = f"{self.ghost_host}/api/v1/order"
+        url = f"{self.ghost_host}/api/v1/activities"
 
         payload = json.dumps(act)
         headers = {
@@ -491,50 +499,57 @@ class SyncIBKR:
             logger.info("No activities to delete")
             return True
 
-        url = f"{self.ghost_host}/api/v1/order"
-
-        payload = {}
         headers = {
             'Authorization': f"Bearer {self.ghost_token}",
         }
-        try:
-            response = requests.request("DELETE",
-                                        url,
-                                        headers=headers,
-                                        params={"accounts": self.create_or_get_IBKR_accountId()},
-                                        data=payload)
-        except Exception as e:
-            logger.info(e)
-            return False
+        params = {"accounts": self.create_or_get_IBKR_accountId()}
 
-        return response.status_code == 200
+        for endpoint in ACTIVITIES_ENDPOINTS:
+            url = f"{self.ghost_host}{endpoint}"
+            try:
+                response = requests.request("DELETE", url, headers=headers, params=params, data={})
+            except Exception as e:
+                logger.info(e)
+                return False
+            if response.status_code == 404:
+                logger.info("Activities endpoint %s not found (404), trying fallback", endpoint)
+                continue
+            return response.status_code == 200
+
+        return False
 
     def get_all_acts_for_account(self, account_id: str = None, range: str = None, symbol: str = None):
         if account_id is None:
             account_id = self.create_or_get_IBKR_accountId()
 
-        url = f"{self.ghost_host}/api/v1/order"
-
-        payload = {}
         headers = {
             'Authorization': f"Bearer {self.ghost_token}",
         }
-        try:
-            response = requests.request("GET",
-                                        url,
-                                        headers=headers,
-                                        params={"accounts": account_id,
-                                                "range": range,  # https://github.com/ghostfolio/ghostfolio/blob/main/libs/common/src/lib/types/date-range.type.ts
-                                                "symbol": symbol},
-                                        data=payload)
-        except Exception as e:
-            logger.info(e)
+        params = {"accounts": account_id,
+                  "range": range,  # https://github.com/ghostfolio/ghostfolio/blob/main/libs/common/src/lib/types/date-range.type.ts
+                  "symbol": symbol}
+
+        for endpoint in ACTIVITIES_ENDPOINTS:
+            url = f"{self.ghost_host}{endpoint}"
+            try:
+                response = requests.request("GET", url, headers=headers, params=params, data={})
+            except Exception as e:
+                logger.info(e)
+                return []
+
+            if response.status_code == 200:
+                return response.json().get('activities', [])
+            if response.status_code == 404:
+                logger.info("Activities endpoint %s not found (404), trying fallback", endpoint)
+                continue
+            logger.error("Failed to fetch activities from %s: %s %s",
+                         url, response.status_code, response.text)
             return []
 
-        if response.status_code == 200:
-            return response.json()['activities']
-        else:
-            return []
+        logger.error("Could not fetch existing activities from any known endpoint (%s). "
+                     "Dedup will treat everything as new and may create duplicates. "
+                     "Check your Ghostfolio version/API.", ", ".join(ACTIVITIES_ENDPOINTS))
+        return []
 
     def get_account_flex_statement(self, query: FlexQueryResponse) -> FlexStatement:
         return next(
