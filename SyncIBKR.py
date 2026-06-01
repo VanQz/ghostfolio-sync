@@ -1,11 +1,11 @@
 import json
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Union
 
 import requests
 import yaml
-from ibflex import client, parser, FlexQueryResponse, BuySell, FlexStatement, Trade, OpenClose
+from ibflex import enums, client, parser, FlexQueryResponse, BuySell, FlexStatement, Trade, ChangeInDividendAccrual, OpenClose
 
 # Create logger
 import logging
@@ -164,17 +164,15 @@ class SyncIBKR:
             return
         self.set_cash_to_account(account_id, get_cash_amount_from_flex(account_statement))
 
-        # Get all stock transactions from the query
-        trades = self.get_stock_transactions(query)
-        
-        for trade in trades:
-            if trade.openCloseIndicator is None:
-                logger.info("trade is not open or close (ignoring): %s", trade)
-            elif trade.openCloseIndicator in (OpenClose.OPEN, OpenClose.CLOSE, OpenClose.OPENCLOSE):
+        for trade in self.get_stock_transactions(account_statement):
+            if trade.openCloseIndicator in (OpenClose.OPEN, OpenClose.CLOSE, OpenClose.OPENCLOSE):
                 date = datetime.strptime(str(trade.dateTime), date_format)
                 iso_format = date.isoformat()
                 symbol = self.get_symbol_for_trade(trade, data_source)
-                trade_id = trade.tradeID or trade.transactionID or trade.ibOrderID
+                trade_id = next(
+                    (str(tid) for tid in [trade.tradeID, trade.transactionID, trade.ibOrderID] if tid is not None),
+                    None
+                )
 
                 if trade.buySell == BuySell.BUY:
                     buysell = "BUY"
@@ -183,7 +181,7 @@ class SyncIBKR:
                 else:
                     logger.info("trade is not buy or sell (ignoring): %s", trade)
                     continue
-                
+
                 activities.append({
                     "accountId": account_id,
                     "comment": f"tradeID={trade_id}",
@@ -199,13 +197,36 @@ class SyncIBKR:
                     "ibkrSymbol": self.symbol_mapping[trade.symbol] if trade.symbol in self.symbol_mapping else trade.symbol
                 })
 
+        for dividend in account_statement.ChangeInDividendAccruals:
+            if len(dividend.code) != 1:
+                logger.warning("Incorrect code in dividend %r", dividend)
+                continue
+            if dividend.code != (enums.Code.REVERSE, ):
+                continue
+            iso_format = dividend.date.isoformat()
+            symbol = self.get_symbol_for_trade(dividend, data_source)
+            activities.append({
+                "accountId": account_id,
+                "comment": f"tradeID={dividend.actionID}",
+                "currency": dividend.currency,
+                "dataSource": data_source,
+                "date": iso_format,
+                "fee": 0.0,
+                "quantity": float(dividend.quantity),
+                "symbol": symbol.replace(" ", "-"),
+                "type": "DIVIDEND",
+                "unitPrice": float(dividend.grossRate),
+                "figi": dividend.figi,
+                "ibkrSymbol": self.symbol_mapping[dividend.symbol] if dividend.symbol in self.symbol_mapping else dividend.symbol
+            })
+
         diff = get_diff(self.get_all_acts_for_account(), activities)
         if len(diff) == 0:
             logger.info("Nothing new to sync")
         else:
             self.import_act(diff)
 
-    def get_symbol_for_trade(self, trade: Trade, data_source: str):
+    def get_symbol_for_trade(self, trade: Union[Trade, ChangeInDividendAccrual], data_source: str):
         symbol = trade.symbol
         if data_source == "YAHOO":
             if trade.isin is not None and len(trade.isin) > 0:
@@ -452,26 +473,22 @@ class SyncIBKR:
             None)
 
     @staticmethod
-    def get_stock_transactions(query: FlexQueryResponse) -> list[Trade]:
+    def get_stock_transactions(account_statement: FlexStatement) -> list[Trade]:
         skipped_categories_counter = {}
         trades: list[Trade] = []
-        for flexStatement in query.FlexStatements:
-            for trade in flexStatement.Trades:
-                if trade.assetCategory is not trade.assetCategory.STOCK:
-                    logger.debug(
-                        f"ignore {trade.assetCategory}, {trade.symbol}: {trade}")
-                    existing_skips = skipped_categories_counter.get(trade.assetCategory,
-                                                                    0)
-                    skipped_categories_counter[trade.assetCategory] = existing_skips + 1
-                    continue
+        for trade in account_statement.Trades:
+            if trade.assetCategory is not trade.assetCategory.STOCK:
+                logger.debug("ignore %s, %s: %s", trade.assetCategory, trade.symbol, trade)
+                skipped_categories_counter[trade.assetCategory] = skipped_categories_counter.get(trade.assetCategory, 0) + 1
+                continue
 
-                if trade.openCloseIndicator is None:
-                    logger.warning("trade is not open or close (ignoring): %s", trade)
-                    continue
+            if trade.openCloseIndicator is None:
+                logger.warning("trade is not open or close (ignoring): %s", trade)
+                continue
 
-                trades.append(trade)
+            trades.append(trade)
 
-        if len(skipped_categories_counter) > 0:
-            logger.info(f"Skipped: {skipped_categories_counter}")
+        if skipped_categories_counter:
+            logger.info("Skipped non-stock trades: %s", skipped_categories_counter)
 
         return trades
