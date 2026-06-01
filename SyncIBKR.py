@@ -2,6 +2,7 @@ import json
 import re
 from datetime import datetime
 from typing import Optional, Union
+from urllib.parse import urlparse, urlunparse
 
 import requests
 import yaml
@@ -10,6 +11,32 @@ from ibflex import enums, client, parser, FlexQueryResponse, BuySell, FlexStatem
 # Create logger
 import logging
 logger = logging.getLogger(__name__)
+
+
+# IBKR retired the gdcdyn.interactivebrokers.com host and the legacy
+# /Universal/servlet/FlexStatementService path. Even when IBKR's SendRequest
+# response returns a legacy <Url> tag (which ibflex's download() blindly
+# follows via stmt_access.Url), we must ignore it and force every Flex Web
+# Service call to the current host + path. We patch submit_request -- the single
+# choke point both request_statement() and download() route through -- so
+# ibflex's own retry/timeout logic stays intact.
+FLEX_HOST = "ndcdyn.interactivebrokers.com"
+FLEX_BASE_PATH = "/AccountManagement/FlexWebService/"
+_original_submit_request = client.submit_request
+
+
+def _force_ndcdyn_submit_request(url, token, query):
+    parsed = urlparse(url)
+    # The 2-step flow only ever calls SendRequest or GetStatement; anything that
+    # isn't SendRequest (incl. the legacy FlexStatementService) is GetStatement.
+    endpoint = "SendRequest" if parsed.path.rstrip("/").endswith("SendRequest") else "GetStatement"
+    new_url = urlunparse(("https", FLEX_HOST, FLEX_BASE_PATH + endpoint, "", "", ""))
+    if new_url != url:
+        logger.info("Forcing IBKR Flex endpoint %s -> %s", url, new_url)
+    return _original_submit_request(new_url, token, query)
+
+
+client.submit_request = _force_ndcdyn_submit_request
 
 
 def get_cash_amount_from_flex(account_statement: FlexStatement) -> dict:
