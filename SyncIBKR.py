@@ -33,6 +33,34 @@ def generate_chunks(lst, n):
         yield lst[i:i + n]
 
 
+# Matches the dedup key stored in an activity's comment, e.g. "tradeID=12345".
+# Uses \S+ (not \d+) so non-numeric IBKR ids (transactionID/ibOrderID/actionID) also match.
+TRADE_ID_PATTERN = re.compile(r"tradeID=(\S+)")
+
+
+def extract_trade_id(comment) -> Optional[str]:
+    if not comment:
+        return None
+    match = TRADE_ID_PATTERN.search(comment)
+    if match:
+        trade_id = match.group(1).strip()
+        # Guard against placeholder/empty ids that would never dedup reliably
+        if trade_id and trade_id != "None":
+            return trade_id
+    return None
+
+
+def pick_trade_id(*candidates) -> Optional[str]:
+    """Return the first candidate that is a usable id (not None, not empty, not 'None')."""
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        value = str(candidate).strip()
+        if value and value != "None":
+            return value
+    return None
+
+
 def format_existing_act(act: dict, symbol_type: str = "symbol") -> dict:
     symbol = act.get("SymbolProfile", {symbol_type: ""}).get(symbol_type)
 
@@ -66,14 +94,9 @@ def format_new_act(act: dict, symbol_type: str = "symbol") -> dict:
 
 def is_act_present(new_act, existing_acts, synced_acts_ids: set):
     # Precise comparison using the IBKR trade id
-    comment = new_act["comment"]
-    if comment is not None:
-        # Extract the tradeID from the comment using regular expressions
-        match = re.search(r"tradeID=(\d+)", comment)
-        if match:
-            trade_id = match.group(1)
-            if trade_id in synced_acts_ids:
-                return True
+    trade_id = extract_trade_id(new_act.get("comment"))
+    if trade_id is not None and trade_id in synced_acts_ids:
+        return True
 
     # Legacy comparison
     for existing_act in existing_acts:
@@ -96,19 +119,35 @@ def get_diff(old_acts, new_acts):
     diff = []
     synced_acts_ids = set()
     for old_act in old_acts:
-        comment = old_act["comment"]
-        if comment is not None:
-            # Extract the tradeID from the comment using regular expressions
-            match = re.search(r"tradeID=(\d+)", comment)
-            if match:
-                trade_id = match.group(1)
-                synced_acts_ids.add(trade_id)
+        trade_id = extract_trade_id(old_act.get("comment"))
+        if trade_id is not None:
+            synced_acts_ids.add(trade_id)
 
+    logger.info("Dedup: fetched %d existing activities, %d carry a usable tradeID",
+                len(old_acts), len(synced_acts_ids))
+    if old_acts and not synced_acts_ids:
+        logger.warning("None of the %d existing activities carry a tradeID comment. "
+                       "Either this Ghostfolio version does not return the 'comment' field, "
+                       "or they were synced without one. Dedup will fall back to fragile "
+                       "field matching and may create duplicates.", len(old_acts))
+
+    new_without_id = 0
     for new_act in new_acts:
+        if extract_trade_id(new_act.get("comment")) is None:
+            new_without_id += 1
+            logger.warning("New activity has no usable tradeID (will rely on fragile legacy "
+                           "matching): date=%s symbol=%s comment=%r",
+                           new_act.get("date"), new_act.get("symbol"), new_act.get("comment"))
         if not is_act_present(new_act, old_acts, synced_acts_ids):
-            del new_act["figi"]
-            del new_act["ibkrSymbol"]
+            new_act.pop("figi", None)
+            new_act.pop("ibkrSymbol", None)
             diff.append(new_act)
+
+    if new_without_id:
+        logger.warning("%d/%d new activities lack a usable tradeID and may duplicate on every "
+                       "sync. Check that your IBKR Flex Query includes the Trade ID / "
+                       "Transaction ID / IB Order ID columns.", new_without_id, len(new_acts))
+    logger.info("Dedup: %d of %d new activities are not yet in Ghostfolio", len(diff), len(new_acts))
     return diff
 
 
@@ -169,10 +208,10 @@ class SyncIBKR:
                 date = datetime.strptime(str(trade.dateTime), date_format)
                 iso_format = date.isoformat()
                 symbol = self.get_symbol_for_trade(trade, data_source)
-                trade_id = next(
-                    (str(tid) for tid in [trade.tradeID, trade.transactionID, trade.ibOrderID] if tid is not None),
-                    None
-                )
+                trade_id = pick_trade_id(trade.tradeID, trade.transactionID, trade.ibOrderID)
+                if trade_id is None:
+                    logger.warning("Trade has no tradeID/transactionID/ibOrderID; it will "
+                                   "duplicate on every sync: %s", trade)
 
                 if trade.buySell == BuySell.BUY:
                     buysell = "BUY"
@@ -205,9 +244,12 @@ class SyncIBKR:
                 continue
             iso_format = dividend.date.isoformat()
             symbol = self.get_symbol_for_trade(dividend, data_source)
+            dividend_id = pick_trade_id(dividend.actionID)
+            if dividend_id is None:
+                logger.warning("Dividend has no actionID; it will duplicate on every sync: %s", dividend)
             activities.append({
                 "accountId": account_id,
-                "comment": f"tradeID={dividend.actionID}",
+                "comment": f"tradeID={dividend_id}",
                 "currency": dividend.currency,
                 "dataSource": data_source,
                 "date": iso_format,
